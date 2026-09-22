@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#050510">
+  <title>Flores Amarillas</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400&family=Quicksand:wght@300;400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+  <canvas id="galaxy-canvas" aria-hidden="true"></canvas>
+
+  <!-- ETAPA 1: Portal de Entrada -->
+  <section id="screen-intro" class="screen active" role="main" aria-label="Portal de entrada">
+    <div class="intro-content">
+      <div class="intro-particles" aria-hidden="true"></div>
+      <div class="falling-petals" aria-hidden="true"></div>
+      <div class="portal-glow" aria-hidden="true"></div>
+      <div class="intro-comet intro-comet--a" aria-hidden="true"></div>
+      <div class="intro-comet intro-comet--b" aria-hidden="true"></div>
+      <p class="intro-subtitle">Un pequeño universo hecho especialmente para ti.</p>
+      <h1 class="intro-title">Hay algo que quiero mostrarte...</h1>
+      <p class="intro-extra">Pero tendrás que descubrirlo tú.</p>
+      <button id="btn-start" class="btn-start" aria-label="Entrar a la experiencia">
+        <span class="btn-text">▶ ENTRAR</span>
+        <span class="btn-glow" aria-hidden="true"></span>
+      </button>
+    </div>
+  </section>
+
+  <!-- Side zones -->
+  <div id="side-left" class="side-zone side-zone--left" role="button" tabindex="0" aria-label="Explorar lado izquierdo">
+    <span class="side-indicator" aria-hidden="true">
+      <span class="side-star">✦</span>
+      <span class="side-arrow">←</span>
+    </span>
+  </div>
+  <div id="side-right" class="side-zone side-zone--right" role="button" tabindex="0" aria-label="Explorar lado derecho">
+    <span class="side-indicator" aria-hidden="true">
+      <span class="side-arrow">→</span>
+      <span class="side-star">✦</span>
+    </span>
+  </div>
+
+  <!-- ETAPA 2: Nacimiento del Universo -->
+  <div id="overlay-birth" class="stage-overlay" aria-live="polite" aria-label="Nacimiento del universo">
+    <p class="birth-line">Todo universo comienza con una pequeña luz.</p>
+    <p class="birth-line">Y este comenzó con una intención muy sencilla...</p>
+    <p class="birth-line">Crear algo para ti.</p>
+  </div>
+
+  <!-- ETAPA 4: Constelaciones -->
+  <div id="overlay-constellations" class="stage-overlay" aria-live="polite" aria-label="Constelaciones">
+    <p class="constellation-label">Constelación de la Alegría</p>
+    <p class="constellation-label">Constelación de los Recuerdos</p>
+    <p class="constellation-label">Constelación de los Sueños</p>
+    <p class="constellation-label">Constelación de la Sonrisa</p>
+  </div>
+
+  <!-- ETAPA 5: Lluvia de Flores -->
+  <div id="overlay-flowers" class="stage-overlay" aria-live="polite" aria-label="Lluvia de flores">
+    <p class="flower-text">Porque algunos universos también florecen.</p>
+  </div>
+
+  <!-- ETAPA 7: Mensajes orbitales -->
+  <div id="overlay-orbit-messages" class="stage-overlay" aria-live="polite" aria-label="Mensajes orbitales"></div>
+
+  <!-- ETAPA 8: Mensaje personal -->
+  <div id="overlay-personal" class="stage-overlay" aria-live="polite" aria-label="Mensaje personal">
+    <p class="personal-line">Después de recorrer todo este universo...</p>
+    <p class="personal-line">me di cuenta de algo.</p>
+    <p class="personal-line">No necesitaba buscar demasiado.</p>
+    <p class="personal-line">Porque hay personas que simplemente...</p>
+    <p class="personal-line">...merecen una flor. 🌻</p>
+  </div>
+
+  <!-- ETAPA 9: Revelación -->
+  <div id="overlay-reveal" class="stage-overlay" aria-live="polite" aria-label="Revelación">
+    <p class="reveal-line">De todas las flores del universo...</p>
+    <p class="reveal-line">elegí esta para ti.</p>
+  </div>
+
+  <!-- ETAPA "MÁS ALLÁ" -->
+  <div id="overlay-beyond" class="stage-overlay stage-overlay--center" aria-live="polite" aria-label="El más allá">
+    <p class="beyond-text">El universo queda atrás...</p>
+    <p class="beyond-text beyond-text--main">Solo queda una flor.</p>
+  </div>
+
+  <!-- ETAPA 10: Personalización -->
+  <div id="overlay-personalize" class="stage-overlay stage-overlay--center" aria-live="polite" aria-label="Personalización">
+    <p id="personalize-name" class="personalize-name"></p>
+    <div id="personalize-photo" class="personalize-photo" aria-hidden="true"></div>
+  </div>
+
+  <!-- ETAPA 11: Carta -->
+  <div id="overlay-letter" class="stage-overlay" aria-live="polite" aria-label="Carta">
+    <div class="letter-content">
+      <p class="letter-line">Quizás sea solamente una flor...</p>
+      <p class="letter-line">...pero detrás de ella hay un deseo.</p>
+      <p class="letter-line">Que tengas días llenos de luz.</p>
+      <p class="letter-line">Que nunca te falten motivos para sonreír.</p>
+      <p class="letter-line">Y que siempre encuentres algo bonito incluso en los días difíciles.</p>
+    </div>
+  </div>
+
+  <!-- ETAPA 12-13: Final -->
+  <section id="screen-final" class="screen" role="main" aria-label="Mensaje final">
+    <div class="final-content">
+      <div class="final-sunflower-halo" aria-hidden="true"></div>
+      <div class="final-sunflower" aria-hidden="true">🌻</div>
+      <p id="final-main" class="final-message-main">Que nunca te falten motivos para sonreír. 💛</p>
+      <p id="final-secondary" class="final-message-secondary">Y cuando el mundo se sienta oscuro,<br>recuerda que siempre puede aparecer una pequeña flor para iluminarlo. 🌻</p>
+      <p id="final-date" class="final-date">Feliz día de las flores amarillas 💛</p>
+      <p id="final-signature" class="final-signature"></p>
+      <div class="final-orbit-items" aria-hidden="true"></div>
+    </div>
+  </section>
+
+  <!-- Controls: Settings + Music -->
+  <div class="controls-bar">
+    <button id="settings-toggle" class="ctrl-btn" aria-label="Configuración" title="Configuración">⚙</button>
+  </div>
+
+  <!-- Settings Panel -->
+  <div id="settings-panel" class="panel panel--settings" role="dialog" aria-label="Configuración">
+    <h3 class="panel-title">EXPERIENCIA</h3>
+    <div class="panel-row">
+      <label class="panel-label">Velocidad</label>
+      <input id="speed-slider" type="range" min="0.5" max="2" step="0.25" value="1" class="panel-slider">
+      <span id="speed-label" class="panel-value">1x</span>
+    </div>
+    <div class="panel-row">
+      <label class="panel-label" for="cinematic-toggle">Modo Cinemático</label>
+      <input id="cinematic-toggle" type="checkbox" class="panel-checkbox">
+    </div>
+  </div>
+
+
+
+  <!-- Audio local (v=20260922 fuerza refresco de caché al actualizar) -->
+  <audio id="bg-music" src="music.mp3?v=20260922" loop preload="auto" playsinline webkit-playsinline></audio>
+
+  <!-- Audio toggle -->
+  <button id="audio-toggle" class="audio-toggle" aria-label="Activar o desactivar musica" title="Musica">
+    <span class="audio-on">🔊</span>
+    <span class="audio-off" style="display:none;">🔇</span>
+  </button>
+
+  <script src="app.js?v=20260922"></script>
+</body>
+</html>
