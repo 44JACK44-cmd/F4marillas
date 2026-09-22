@@ -1015,13 +1015,22 @@ var VID = {
              !!D.canvas && typeof D.canvas.captureStream === 'function';
     }catch(e){ return false; }
   },
-  pickMime:function(){
-    var list = [
+  /* MP4 primero: lleva duración e índice, así la galería/WhatsApp lo aceptan,
+     se puede adelantar y compartir. WebM queda como reserva (se le parchea
+     la duración al terminar). */
+  candidates:function(){
+    return [
+      'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+      'video/mp4;codecs=avc1.4d002a,mp4a.40.2',
+      'video/mp4;codecs=avc1,mp4a.40.2',
+      'video/mp4',
       'video/webm;codecs=vp9,opus',
       'video/webm;codecs=vp8,opus',
-      'video/webm',
-      'video/mp4'
+      'video/webm'
     ];
+  },
+  pickMime:function(){
+    var list = VID.candidates();
     for(var i = 0; i < list.length; i++){
       try{ if(MediaRecorder.isTypeSupported(list[i])) return list[i]; }catch(e){}
     }
@@ -1077,14 +1086,27 @@ var VID = {
       }
     }catch(e){}
 
-    var m = VID.pickMime();
-    try{
-      VID.rec = m ? new MediaRecorder(stream, {mimeType:m, videoBitsPerSecond:16000000, audioBitsPerSecond:192000, framerate:60})
-                  : new MediaRecorder(stream);
-    }catch(e){ toast('No se pudo iniciar la grabación ✦'); return; }
-
-    VID.mime = VID.rec.mimeType || m || 'video/webm';
+    var rec = null;
+    var supported = [];
+    var cands = VID.candidates();
+    for(var ci = 0; ci < cands.length; ci++){
+      try{ if(MediaRecorder.isTypeSupported(cands[ci])) supported.push(cands[ci]); }catch(e){}
+    }
+    for(var ri = 0; ri < supported.length; ri++){
+      try{
+        rec = new MediaRecorder(stream, {mimeType: supported[ri], videoBitsPerSecond:16000000, audioBitsPerSecond:192000, framerate:60});
+        break;
+      }catch(e){}
+    }
+    if(!rec){
+      try{ rec = new MediaRecorder(stream); }
+      catch(e){ toast('No se pudo iniciar la grabación ✦'); return; }
+    }
+    VID.rec = rec;
+    VID.mime = rec.mimeType || supported[0] || 'video/webm';
     VID.ext = VID.mime.indexOf('mp4') >= 0 ? '.mp4' : '.webm';
+    VID.recStartT = performance.now();
+    VID.durationMs = 0;
 
     VID.rec.ondataavailable = function(e){
       if(e.data && e.data.size) VID.chunks.push(e.data);
@@ -1106,6 +1128,7 @@ var VID = {
   stop:function(){
     if(!VID.active) return;
     VID.active = false;
+    VID.durationMs = Math.max(200, performance.now() - (VID.recStartT || performance.now()));
     if(VID.timer){ clearTimeout(VID.timer); VID.timer = null; }
     try{
       if(VID.rec && VID.rec.state !== 'inactive') VID.rec.stop();
@@ -1127,11 +1150,37 @@ var VID = {
     VID.chunks.forEach(function(c){ size += c.size; });
     if(!size){ toast('No se pudo generar el video ✦'); VID.chunks = []; return; }
 
+    if(!(VID.durationMs > 0)){
+      VID.durationMs = Math.max(200, performance.now() - (VID.recStartT || performance.now()));
+    }
+
+    var rawBlob;
     try{
-      VID.blob = new Blob(VID.chunks, {type: (VID.mime.split(';')[0] || 'video/webm')});
-      VID.url = URL.createObjectURL(VID.blob);
+      rawBlob = new Blob(VID.chunks, {type: (VID.mime.split(';')[0] || 'video/webm')});
     }catch(e){ toast('No se pudo generar el video ✦'); VID.chunks = []; return; }
     VID.chunks = [];
+
+    /* WebM de MediaRecorder sale sin Duration → la galería no muestra la
+       duración, no se puede adelantar ni compartir. Se parchea aquí. */
+    if(VID.ext === '.webm' && typeof rawBlob.arrayBuffer === 'function'){
+      rawBlob.arrayBuffer().then(function(ab){
+        var out = null;
+        try{ out = fixWebmDuration(ab, VID.durationMs); }catch(e){}
+        VID.blob = (out && out.length) ? new Blob([out], {type:'video/webm'}) : rawBlob;
+        VID.finalize(rawBlob.size);
+      }, function(){
+        VID.blob = rawBlob;
+        VID.finalize(rawBlob.size);
+      });
+      return;
+    }
+    VID.blob = rawBlob;
+    VID.finalize(size);
+  },
+  finalize:function(size){
+    try{
+      VID.url = URL.createObjectURL(VID.blob);
+    }catch(e){ toast('No se pudo generar el video ✦'); return; }
 
     VID.download();
     var mb = (size / 1048576).toFixed(1);
@@ -1150,6 +1199,132 @@ var VID = {
     }catch(e){ toast('No se pudo guardar el archivo ✦'); }
   }
 };
+
+/* Parchea el elemento Duration de un WebM (EBML) para que la galería y
+   otras apps muestren duración, permitan adelantar y compartir.
+   Si Duration ya existe se sobrescribe; si no, se inserta al final de Info. */
+function fixWebmDuration(ab, durMs){
+  if(!(durMs > 0)) return null;
+  var buf = new Uint8Array(ab);
+  if(buf.length < 64) return null;
+
+  function vintLen(b){
+    if(b === undefined || b === 0) return 0;
+    var n = 0;
+    while(n < 8 && !(b & (0x80 >> n))) n++;
+    return n + 1;
+  }
+  function readId(p){
+    var len = vintLen(buf[p]);
+    if(!len) return {id:-1, len:0};
+    var id = 0;
+    for(var i = 0; i < len; i++) id = id * 256 + buf[p + i];
+    return {id:id, len:len};
+  }
+  function readSize(p){
+    var first = buf[p];
+    var len = vintLen(first);
+    if(!len) return null;
+    var mask = (len >= 8) ? 0 : ((1 << (8 - len)) - 1);
+    var val = first & mask;
+    var unknown = (first | mask) === first && mask !== 0;
+    for(var i = 1; i < len; i++){
+      if(buf[p + i] !== 0xFF) unknown = false;
+      val = val * 256 + buf[p + i];
+    }
+    if(len === 1) unknown = ((first & 0x7F) === 0x7F);
+    return {val:val, len:len, unknown:unknown};
+  }
+  function encSize(v){
+    if(v <= 126) return [0x80 | v];
+    if(v <= 16382) return [0x40 | Math.floor(v / 256), v & 0xFF];
+    if(v <= 2097150) return [0x20 | (v >> 16), (v >> 8) & 0xFF, v & 0xFF];
+    if(v <= 268435454) return [0x10 | Math.floor(v / 16777216) & 0x0F, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF];
+    var rest = v, tail = [];
+    for(var i = 0; i < 7; i++){ tail.unshift(rest & 0xFF); rest = Math.floor(rest / 256); }
+    return [0x01 | rest].concat(tail);
+  }
+
+  var p = 0;
+  var hId = readId(p);
+  if(hId.id !== 0x1A45DFA3) return null;
+  p += hId.len;
+  var hSz = readSize(p);
+  if(!hSz || hSz.unknown) return null;
+  p += hSz.len + hSz.val;
+
+  var sId = readId(p);
+  if(sId.id !== 0x18538067) return null;
+  p += sId.len;
+  var sSzPos = p;
+  var sSz = readSize(p);
+  if(!sSz) return null;
+  p += sSz.len;
+
+  var info = null, q = p, guard = 0;
+  while(q < buf.length && guard++ < 64){
+    var cid = readId(q);
+    if(cid.id === -1) return null;
+    var csz = readSize(q + cid.len);
+    if(!csz) return null;
+    if(cid.id === 0x1549A966){
+      info = {idPos:q, idLen:cid.len, szPos:q + cid.len, szLen:csz.len, szVal:csz.val, dataStart:q + cid.len + csz.len};
+      break;
+    }
+    if(csz.unknown) return null;
+    q = q + cid.len + csz.len + csz.val;
+  }
+  if(!info) return null;
+  var infoDataEnd = info.dataStart + info.szVal;
+  if(infoDataEnd > buf.length || infoDataEnd <= info.dataStart) return null;
+
+  var r = info.dataStart, scale = 1000000, durPos = -1;
+  while(r < infoDataEnd){
+    var iid = readId(r);
+    if(iid.id === -1) break;
+    r += iid.len;
+    var isz = readSize(r);
+    if(!isz || isz.unknown) break;
+    r += isz.len;
+    if(iid.id === 0x2AD7B1){
+      var v = 0;
+      for(var i = 0; i < isz.val && i < 8; i++) v = v * 256 + buf[r + i];
+      if(v > 0) scale = v;
+    } else if(iid.id === 0x4489 && isz.val === 8){
+      durPos = r;
+    }
+    r += isz.val;
+  }
+
+  var ticks = (durMs * 1e6) / scale;
+  if(durPos >= 0){
+    var out0 = buf.slice();
+    new DataView(out0.buffer).setFloat64(durPos, ticks, false);
+    return out0;
+  }
+
+  var durEl = new Uint8Array([0x44, 0x89, 0x88, 0, 0, 0, 0, 0, 0, 0, 0]);
+  new DataView(durEl.buffer).setFloat64(3, ticks, false);
+
+  var newInfoSz = encSize(info.szVal + 11);
+  var useNewSeg = !sSz.unknown;
+  var newSegSz = useNewSeg ? encSize(sSz.val + (newInfoSz.length - info.szLen) + 11) : null;
+
+  var segSizeField = newSegSz ? new Uint8Array(newSegSz) : buf.slice(sSzPos, sSzPos + sSz.len);
+  var midStart = sSzPos + sSz.len;
+  var midLen = info.szPos - midStart;
+  var outLen = sSzPos + segSizeField.length + midLen + newInfoSz.length + info.szVal + 11 + (buf.length - infoDataEnd);
+  var out = new Uint8Array(outLen);
+  var o = 0;
+  out.set(buf.slice(0, sSzPos), o); o += sSzPos;
+  out.set(segSizeField, o); o += segSizeField.length;
+  if(midLen > 0){ out.set(buf.slice(midStart, info.szPos), o); o += midLen; }
+  out.set(new Uint8Array(newInfoSz), o); o += newInfoSz.length;
+  out.set(buf.slice(info.dataStart, infoDataEnd), o); o += info.szVal;
+  out.set(durEl, o); o += 11;
+  out.set(buf.slice(infoDataEnd), o);
+  return out;
+}
 
 /* Depuración de audio/grabación (no afecta a la experiencia) */
 window.__FA = {VID:VID, BG_MUSIC:BG_MUSIC, ctx:function(){ return clickAudioCtx; }, route:routeMusicThroughGraph, fade:fadeAudioVolume, draw:drawRecOverlayTexts, stage:function(){ return S.stage; }, perf:function(){ return S.perf; }};
