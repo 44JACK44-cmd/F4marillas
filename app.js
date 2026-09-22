@@ -104,6 +104,7 @@ var S = {
   stage:'intro', idx:0,
   W:0, H:0, cx:0, cy:0,
   frame:null, timers:[], lastTime:0, dt:1,
+  perf:0, fEMA:0, slowMs:0, fastMs:0,
   reduced:window.matchMedia('(prefers-reduced-motion:reduce)').matches,
   transitioning:false, interactionCount:0,
   mx:0, my:0, mxn:0, myn:0,
@@ -222,24 +223,47 @@ function playClickChime(){
   var ctx = ensureClickAudio();
   if(!ctx) return;
   var now = ctx.currentTime;
-  var notes = [1046.5, 1568]; /* pequeño destello tipo campanita, dos tonos */
-  notes.forEach(function(freq, i){
-    var osc = ctx.createOscillator();
-    var gain = ctx.createGain();
-    osc.type = 'sine';
-    osc.frequency.value = freq;
-    var start = now + i * 0.05;
-    gain.gain.setValueAtTime(0.0001, start);
-    gain.gain.linearRampToValueAtTime(0.085, start + 0.015);
-    gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.55);
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    /* Si hay grabación activa, el destello también entra al video */
+  /* Motivo suave en Mi menor (tono de la canción): E5 → B5, cálido y delicado */
+  var notes = [
+    {f:659.25, vol:0.038, delay:0,    decay:1.15},
+    {f:987.77, vol:0.02,  delay:0.13, decay:0.9}
+  ];
+  notes.forEach(function(nt){
+    var detune = Math.random() * 10 - 5; /* centos: evita la repetición mecánica */
+    var start = now + nt.delay;
+    var bus = ctx.createGain();
+    bus.gain.setValueAtTime(0.0001, start);
+    bus.gain.linearRampToValueAtTime(nt.vol, start + 0.055); /* ataque lento = bloom suave, sin golpe */
+    bus.gain.exponentialRampToValueAtTime(0.0001, start + nt.decay);
+    var lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 2600;
+    lp.Q.value = 0.3;
+    bus.connect(lp);
+    lp.connect(ctx.destination);
+    /* Si hay grabación activa, el sonido también entra al video */
     if(ctx._faRecDest){
-      try{ gain.connect(ctx._faRecDest); }catch(e){}
+      try{ lp.connect(ctx._faRecDest); }catch(e){}
     }
-    osc.start(start);
-    osc.stop(start + 0.6);
+    /* Fundamental + octava muy tenue = timbre suave como de caracol */
+    var partials = [[1, 1], [2, 0.13]];
+    partials.forEach(function(p){
+      var osc = ctx.createOscillator();
+      var g = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = nt.f * p[0];
+      osc.detune.value = detune;
+      if(p[0] === 1){
+        g.gain.value = p[1];
+      } else {
+        g.gain.setValueAtTime(p[1], start);
+        g.gain.exponentialRampToValueAtTime(0.0001, start + nt.decay * 0.35);
+      }
+      osc.connect(g);
+      g.connect(bus);
+      osc.start(start);
+      osc.stop(start + nt.decay + 0.05);
+    });
   });
 }
 
@@ -247,10 +271,20 @@ function playClickChime(){
    3D PROJECTION — Spherical camera
    Project a world-space point through camera yaw/pitch
    ============================================= */
-function project3D(wx, wy, wz) {
+/* Buffer reutilizable para llamadas calientes (evita ~2000 objetos/frame) */
+var _p3o = {x:0, y:0, s:1, z:0, visible:false};
+var _p3CosY = 1, _p3SinY = 0, _p3CosP = 1, _p3SinP = 0;
+var _p3Yaw = 1e9, _p3Pitch = 1e9;
+function project3D(wx, wy, wz, out) {
   var w = S.W, h = S.H;
-  var cosY = Math.cos(S.cam.yaw), sinY = Math.sin(S.cam.yaw);
-  var cosP = Math.cos(S.cam.pitch), sinP = Math.sin(S.cam.pitch);
+  /* Trigonometría de la cámara cacheada: se recalcula solo si la cámara cambia */
+  if(_p3Yaw !== S.cam.yaw || _p3Pitch !== S.cam.pitch){
+    _p3Yaw = S.cam.yaw; _p3Pitch = S.cam.pitch;
+    _p3CosY = Math.cos(_p3Yaw); _p3SinY = Math.sin(_p3Yaw);
+    _p3CosP = Math.cos(_p3Pitch); _p3SinP = Math.sin(_p3Pitch);
+  }
+  var cosY = _p3CosY, sinY = _p3SinY;
+  var cosP = _p3CosP, sinP = _p3SinP;
 
   /* Rotate around Y axis (yaw) */
   var x1 = wx * cosY + wz * sinY;
@@ -267,13 +301,94 @@ function project3D(wx, wy, wz) {
   if(d < 50) d = 50; /* prevent behind-camera collapse */
   var scale = fov / d;
 
-  return {
-    x: w/2 + x1 * scale * S.cam.zoom,
-    y: h/2 + y2 * scale * S.cam.zoom,
-    s: scale * S.cam.zoom,
-    z: z2,
-    visible: z2 > -fov + 100
-  };
+  var r = out || {};
+  r.x = w/2 + x1 * scale * S.cam.zoom;
+  r.y = h/2 + y2 * scale * S.cam.zoom;
+  r.s = scale * S.cam.zoom;
+  r.z = z2;
+  r.visible = z2 > -fov + 100;
+  return r;
+}
+
+/* =============================================
+   CACHES DE RENDER — evitan concatenar strings,
+   crear gradientes y usar shadowBlur cada frame
+   ============================================= */
+var _ccCache = {};
+function cc(r, g, b){
+  var k = ((r & 255) << 16) | ((g & 255) << 8) | (b & 255);
+  var v = _ccCache[k];
+  if(v === undefined){
+    v = 'rgb(' + r + ',' + g + ',' + b + ')';
+    _ccCache[k] = v;
+  }
+  return v;
+}
+
+var _glowSpriteCache = {};
+function glowSprite(r, g, b){
+  var k = ((r & 255) << 16) | ((g & 255) << 8) | (b & 255);
+  var s = _glowSpriteCache[k];
+  if(!s){
+    s = document.createElement('canvas');
+    s.width = 64; s.height = 64;
+    var g2 = s.getContext('2d');
+    var gr = g2.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gr.addColorStop(0, 'rgba(' + r + ',' + g + ',' + b + ',0.8)');
+    gr.addColorStop(1, 'rgba(' + r + ',' + g + ',' + b + ',0)');
+    g2.fillStyle = gr;
+    g2.fillRect(0, 0, 64, 64);
+    _glowSpriteCache[k] = s;
+  }
+  return s;
+}
+
+var _upgCache = {};
+function unitPetalGrad(ctx, c){
+  var k = ((c[0] & 255) << 16) | ((c[1] & 255) << 8) | (c[2] & 255);
+  var g = _upgCache[k];
+  if(!g){
+    g = ctx.createLinearGradient(0, -1, 0, 1);
+    g.addColorStop(0, 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',0.9)');
+    g.addColorStop(0.5, 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',1)');
+    g.addColorStop(1, 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',0.7)');
+    _upgCache[k] = g;
+  }
+  return g;
+}
+
+var _gfGrad = null;
+function gfPetalGrad(ctx){
+  if(!_gfGrad){
+    _gfGrad = ctx.createLinearGradient(0, 0, 0, -2);
+    _gfGrad.addColorStop(0, 'rgba(255,180,60,0.9)');
+    _gfGrad.addColorStop(1, 'rgba(255,215,0,0.5)');
+  }
+  return _gfGrad;
+}
+
+var _tunGlowGrad = null;
+function tunGlowGrad(ctx){
+  if(!_tunGlowGrad){
+    _tunGlowGrad = ctx.createRadialGradient(0, 0, 0, 0, 0, 1);
+    _tunGlowGrad.addColorStop(0, 'rgba(255,240,180,0.3)');
+    _tunGlowGrad.addColorStop(1, 'rgba(255,240,180,0)');
+  }
+  return _tunGlowGrad;
+}
+
+var _usgCache = {};
+function unitSunflowerGrad(ctx, color){
+  var k = color[0] + '|' + color[1] + '|' + color[2];
+  var g = _usgCache[k];
+  if(!g){
+    g = ctx.createLinearGradient(0, 0, 0, -1);
+    g.addColorStop(0, color[0]);
+    g.addColorStop(0.5, color[1]);
+    g.addColorStop(1, color[2]);
+    _usgCache[k] = g;
+  }
+  return g;
 }
 
 /* =============================================
@@ -1037,7 +1152,7 @@ var VID = {
 };
 
 /* Depuración de audio/grabación (no afecta a la experiencia) */
-window.__FA = {VID:VID, BG_MUSIC:BG_MUSIC, ctx:function(){ return clickAudioCtx; }, route:routeMusicThroughGraph, fade:fadeAudioVolume, draw:drawRecOverlayTexts};
+window.__FA = {VID:VID, BG_MUSIC:BG_MUSIC, ctx:function(){ return clickAudioCtx; }, route:routeMusicThroughGraph, fade:fadeAudioVolume, draw:drawRecOverlayTexts, stage:function(){ return S.stage; }, perf:function(){ return S.perf; }};
 
 function showFinalDl(){
   var fd = document.getElementById('final-dl');
@@ -2926,41 +3041,42 @@ function drawSunflowerPetal(ctx, x, y, length, width, angle, color, glowColor, o
   ctx.translate(x, y);
   ctx.rotate(angle);
   ctx.globalAlpha = opacity;
+  if(length > 0.01){
+    /* Normaliza Y para pintar con el gradiente unitario cacheado:
+       tras scale(1,1/length) el trazo y el gradiente quedan idénticos al original */
+    ctx.scale(1, 1/length);
 
-  /* Petal body with bezier curves */
-  ctx.beginPath();
-  ctx.moveTo(0, 0);
-  ctx.bezierCurveTo(
-    width * 0.6, -length * 0.2,
-    width * 0.8, -length * 0.6,
-    width * 0.15, -length
-  );
-  ctx.bezierCurveTo(
-    0, -length * 1.05,
-    -width * 0.15, -length * 1.0,
-    -width * 0.15, -length
-  );
-  ctx.bezierCurveTo(
-    -width * 0.8, -length * 0.6,
-    -width * 0.6, -length * 0.2,
-    0, 0
-  );
+    /* Petal body with bezier curves */
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.bezierCurveTo(
+      width * 0.6, -0.2,
+      width * 0.8, -0.6,
+      width * 0.15, -1
+    );
+    ctx.bezierCurveTo(
+      0, -1.05,
+      -width * 0.15, -1.0,
+      -width * 0.15, -1
+    );
+    ctx.bezierCurveTo(
+      -width * 0.8, -0.6,
+      -width * 0.6, -0.2,
+      0, 0
+    );
 
-  /* Gradient fill */
-  var grad = ctx.createLinearGradient(0, 0, 0, -length);
-  grad.addColorStop(0, color[0]);
-  grad.addColorStop(0.5, color[1]);
-  grad.addColorStop(1, color[2]);
-  ctx.fillStyle = grad;
-  ctx.fill();
+    /* Gradient fill — sin crear un gradiente cada frame */
+    ctx.fillStyle = unitSunflowerGrad(ctx, color);
+    ctx.fill();
 
-  /* Subtle central vein */
-  ctx.strokeStyle = 'rgba(200,160,40,' + (opacity * 0.3) + ')';
-  ctx.lineWidth = 0.5;
-  ctx.beginPath();
-  ctx.moveTo(0, -2);
-  ctx.lineTo(0, -length * 0.85);
-  ctx.stroke();
+    /* Subtle central vein */
+    ctx.strokeStyle = 'rgba(200,160,40,' + (opacity * 0.3) + ')';
+    ctx.lineWidth = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(0, -2/length);
+    ctx.lineTo(0, -0.85);
+    ctx.stroke();
+  }
 
   ctx.restore();
 }
@@ -2997,9 +3113,21 @@ function drawMiniFlower(ctx, x, y, sz, petalCount, rot, hue, opacity){
    MAIN LOOP
    ============================================= */
 function loop(timestamp){
-  var rawDt = (timestamp - S.lastTime) / 16.667;
-  S.dt = Math.min(rawDt, 3) * getSpeed();
+  var frameMs = timestamp - S.lastTime;
+  var rawDt = frameMs / 16.667;
   S.lastTime = timestamp;
+
+  /* Gobernador anti-lag: si los frames se alargan de forma sostenida,
+     sube S.perf (reduce efectos caros) y los restaura cuando hay margen */
+  if(frameMs > 8 && frameMs < 500){
+    S.fEMA = S.fEMA ? (S.fEMA * 0.93 + frameMs * 0.07) : frameMs;
+    if(S.fEMA > 26){ S.slowMs += frameMs; S.fastMs = 0; }
+    else if(S.fEMA < 15){ S.fastMs += frameMs; S.slowMs = 0; }
+    else { S.slowMs = 0; S.fastMs = 0; }
+    if(S.slowMs > 1600 && S.perf < 2){ S.perf++; S.slowMs = 0; S.fEMA = 20; }
+    else if(S.perf > 0 && S.fastMs > 6000){ S.perf--; S.fastMs = 0; S.slowMs = 0; }
+  }
+
   var _t = timestamp / 1000;
 
   var w = S.W, h = S.H;
@@ -3076,6 +3204,14 @@ function loop(timestamp){
   var showForeground = st !== 'intro' && st !== 'portal' && st !== 'tunnel';
   var showSunflower = st === 'sunflowerReveal' || st === 'universe' || st === 'constellations' || st === 'flowerRain' || st === 'sunflowerBirth' || st === 'orbitMsgs' || st === 'personal' || st === 'reveal' || st === 'beyond' || isExplore;
 
+  /* Nivel de calidad adaptativo del gobernador anti-lag */
+  var perf = S.perf;
+  var deepStride = perf >= 2 ? 3 : (perf === 1 ? 2 : 1);
+  var detStride = perf > 0 ? 2 : 1;
+  var petalStride = perf >= 2 ? 2 : 1;
+  var halosOn = perf < 1;
+  var glowFx = perf < 2;
+
   /* =============================================
      RENDER: NEBULAE
      ============================================= */
@@ -3087,7 +3223,7 @@ function loop(timestamp){
 
       var ngx, ngy;
       if(use3D){
-        var nProj = project3D(ne.wx, ne.wy, ne.wz);
+        var nProj = project3D(ne.wx, ne.wy, ne.wz, _p3o);
         if(!nProj.visible) continue;
         ngx = nProj.x;
         ngy = nProj.y;
@@ -3100,12 +3236,23 @@ function loop(timestamp){
       }
 
       var nebR = ne.r * (use3D ? (nProj ? nProj.s : 1) : 1);
-      var grd = ctx.createRadialGradient(ngx, ngy, 0, ngx, ngy, nebR);
-      grd.addColorStop(0, 'rgba('+ne.c[0]+','+ne.c[1]+','+ne.c[2]+','+nep+')');
-      grd.addColorStop(0.5, 'rgba('+ne.c[0]+','+ne.c[1]+','+ne.c[2]+','+(nep*0.3)+')');
-      grd.addColorStop(1, 'rgba('+ne.c[0]+','+ne.c[1]+','+ne.c[2]+',0)');
-      ctx.fillStyle = grd;
-      ctx.fillRect(ngx-nebR, ngy-nebR, nebR*2, nebR*2);
+      /* Gradiente unitario cacheado por nebulosa: el canvas lo transforma al pintar,
+         así no se crea un gradiente nuevo cada frame */
+      if(!ne._gr){
+        var a0 = Math.min(ne.op * 12, 0.98);
+        ne._gr = ctx.createRadialGradient(0, 0, 0, 0, 0, 1);
+        ne._gr.addColorStop(0, 'rgba('+ne.c[0]+','+ne.c[1]+','+ne.c[2]+','+a0+')');
+        ne._gr.addColorStop(0.5, 'rgba('+ne.c[0]+','+ne.c[1]+','+ne.c[2]+','+(a0*0.3)+')');
+        ne._gr.addColorStop(1, 'rgba('+ne.c[0]+','+ne.c[1]+','+ne.c[2]+',0)');
+      }
+      var nebS = nebR > 1 ? nebR : 1;
+      ctx.save();
+      ctx.translate(ngx, ngy);
+      ctx.scale(nebS, nebS);
+      ctx.globalAlpha = Math.min(nep / (ne.op * 12), 1);
+      ctx.fillStyle = ne._gr;
+      ctx.fillRect(-1, -1, 2, 2);
+      ctx.restore();
     }
   }
 
@@ -3116,7 +3263,7 @@ function loop(timestamp){
     /* Cintas de estrellas */
     for(var si = 0; si < S.starStreams.length; si++){
       var stream = S.starStreams[si];
-      for(var pi = 0; pi < stream.length; pi++){
+      for(var pi = 0; pi < stream.length; pi += detStride){
         var p = stream[pi];
         p.twinkle += 0.02 * S.dt;
         var tw = 0.6 + Math.sin(p.twinkle) * 0.4;
@@ -3125,7 +3272,7 @@ function loop(timestamp){
         ctx.globalAlpha = p.op * tw;
         ctx.beginPath();
         ctx.arc(sx, sy, p.sz, 0, TWO_PI);
-        ctx.fillStyle = 'rgba('+p.c[0]+','+p.c[1]+','+p.c[2]+',1)';
+        ctx.fillStyle = cc(p.c[0], p.c[1], p.c[2]);
         ctx.fill();
       }
     }
@@ -3134,14 +3281,14 @@ function loop(timestamp){
     /* Nubes de polvo */
     for(var ci = 0; ci < S.dustClouds.length; ci++){
       var cloud = S.dustClouds[ci];
-      for(var pi = 0; pi < cloud.particles.length; pi++){
+      for(var pi = 0; pi < cloud.particles.length; pi += detStride){
         var p = cloud.particles[pi];
         var cx = ((p.wx * 0.28 + w/2 + px * 0.25 + _t * cloud.drift * 10) % w + w) % w;
         var cy = ((p.wy * 0.28 + h/2 + py * 0.2) % h + h) % h;
         ctx.globalAlpha = p.op;
         ctx.beginPath();
         ctx.arc(cx, cy, p.sz, 0, TWO_PI);
-        ctx.fillStyle = 'rgba('+cloud.c[0]+','+cloud.c[1]+','+cloud.c[2]+',1)';
+        ctx.fillStyle = cc(cloud.c[0], cloud.c[1], cloud.c[2]);
         ctx.fill();
       }
     }
@@ -3157,7 +3304,7 @@ function loop(timestamp){
       var x2 = ((ray.wx2 * 0.35 + w/2 + px * 0.3) % w + w) % w;
       var y2 = ((ray.wy2 * 0.35 + h/2 + py * 0.25) % h + h) % h;
       ctx.globalAlpha = ray.op;
-      ctx.strokeStyle = 'rgba('+ray.c[0]+','+ray.c[1]+','+ray.c[2]+',1)';
+      ctx.strokeStyle = cc(ray.c[0], ray.c[1], ray.c[2]);
       ctx.lineWidth = 0.5;
       ctx.beginPath();
       ctx.moveTo(x1, y1);
@@ -3172,7 +3319,7 @@ function loop(timestamp){
      ============================================= */
   if(showStars){
     /* Pétalos dorados flotantes */
-    for(var pi = 0; pi < S.goldenPetals.length; pi++){
+    for(var pi = 0; pi < S.goldenPetals.length; pi += petalStride){
       var p = S.goldenPetals[pi];
       p.wobblePhase += p.wobbleSpeed * S.dt;
       p.rotation += p.rotSpeed * S.dt;
@@ -3186,7 +3333,7 @@ function loop(timestamp){
       
       var px2, py2;
       if(use3D){
-        var pProj = project3D(p.wx, p.wy + wobble, p.wz);
+        var pProj = project3D(p.wx, p.wy + wobble, p.wz, _p3o);
         if(!pProj.visible) continue;
         px2 = pProj.x;
         py2 = pProj.y;
@@ -3197,26 +3344,22 @@ function loop(timestamp){
         var pScale = 1;
       }
       
-      /* Dibujar pétalo como elipse rotada */
+      /* Dibujar pétalo como elipse rotada — gradiente unitario cacheado + escala */
+      var ps = p.sz * pScale;
       ctx.save();
       ctx.translate(px2, py2);
       ctx.rotate(p.rotation);
+      ctx.scale(ps, ps);
       ctx.globalAlpha = p.op;
-      
-      var grd = ctx.createLinearGradient(0, -p.sz*pScale, 0, p.sz*pScale);
-      grd.addColorStop(0, 'rgba('+p.c[0]+','+p.c[1]+','+p.c[2]+',0.9)');
-      grd.addColorStop(0.5, 'rgba('+p.c[0]+','+p.c[1]+','+p.c[2]+',1)');
-      grd.addColorStop(1, 'rgba('+p.c[0]+','+p.c[1]+','+p.c[2]+',0.7)');
-      
-      ctx.fillStyle = grd;
+      ctx.fillStyle = unitPetalGrad(ctx, p.c);
       ctx.beginPath();
-      ctx.ellipse(0, 0, p.sz*2*pScale, p.sz*0.6*pScale, 0, 0, TWO_PI);
+      ctx.ellipse(0, 0, 2, 0.6, 0, 0, TWO_PI);
       ctx.fill();
       
       /* Brillo */
       ctx.globalAlpha = p.op * 0.3;
       ctx.beginPath();
-      ctx.ellipse(0, 0, p.sz*3*pScale, p.sz*1.2*pScale, 0, 0, TWO_PI);
+      ctx.ellipse(0, 0, 3, 1.2, 0, 0, TWO_PI);
       ctx.fillStyle = 'rgba(255,240,180,1)';
       ctx.fill();
       
@@ -3232,7 +3375,7 @@ function loop(timestamp){
       
       var spx, spy;
       if(use3D){
-        var spProj = project3D(sp.wx, sp.wy, sp.wz);
+        var spProj = project3D(sp.wx, sp.wy, sp.wz, _p3o);
         if(!spProj.visible) continue;
         spx = spProj.x;
         spy = spProj.y;
@@ -3252,7 +3395,7 @@ function loop(timestamp){
       ctx.globalAlpha = finalOp;
       
       /* Rayos horizontales y verticales */
-      ctx.strokeStyle = 'rgba('+sp.c[0]+','+sp.c[1]+','+sp.c[2]+',1)';
+      ctx.strokeStyle = cc(sp.c[0], sp.c[1], sp.c[2]);
       ctx.lineWidth = finalSz * 0.3;
       ctx.lineCap = 'round';
       
@@ -3268,20 +3411,16 @@ function loop(timestamp){
       
       /* Centro brillante */
       ctx.globalAlpha = finalOp * 1.2;
-      ctx.fillStyle = 'rgba('+sp.c[0]+','+sp.c[1]+','+sp.c[2]+',1)';
+      ctx.fillStyle = cc(sp.c[0], sp.c[1], sp.c[2]);
       ctx.beginPath();
       ctx.arc(0, 0, finalSz, 0, TWO_PI);
       ctx.fill();
       
-      /* Halo */
-      ctx.globalAlpha = finalOp * 0.3;
-      var haloGrd = ctx.createRadialGradient(0, 0, 0, 0, 0, finalSz*4);
-      haloGrd.addColorStop(0, 'rgba(255,240,180,0.8)');
-      haloGrd.addColorStop(1, 'rgba(255,240,180,0)');
-      ctx.fillStyle = haloGrd;
-      ctx.beginPath();
-      ctx.arc(0, 0, finalSz*4, 0, TWO_PI);
-      ctx.fill();
+      /* Halo — sprite pre-renderado en lugar de crear un gradiente por frame */
+      if(halosOn && finalSz > 0.5){
+        ctx.globalAlpha = finalOp * 0.3;
+        ctx.drawImage(glowSprite(255, 240, 180), -finalSz*4, -finalSz*4, finalSz*8, finalSz*8);
+      }
       
       ctx.restore();
     }
@@ -3292,7 +3431,7 @@ function loop(timestamp){
      RENDER: DEEP STARS
      ============================================= */
   if(showStars){
-    for(var i = 0; i < S.deepStars.length; i++){
+    for(var i = 0; i < S.deepStars.length; i += deepStride){
       var s = S.deepStars[i];
       s.twinklePhase += s.twinkle * S.dt;
       var tw = 0.7 + Math.sin(s.twinklePhase) * 0.3;
@@ -3300,7 +3439,7 @@ function loop(timestamp){
 
       var sx2, sy2;
       if(use3D){
-        var proj = project3D(s.wx, s.wy, s.wz);
+        var proj = project3D(s.wx, s.wy, s.wz, _p3o);
         if(!proj.visible) continue;
         sx2 = proj.x;
         sy2 = proj.y;
@@ -3310,22 +3449,24 @@ function loop(timestamp){
         sy2 = ((s.wy * 0.3 + h/2 + py * parallaxF) % h + h) % h;
       }
 
+      ctx.globalAlpha = op;
+      ctx.fillStyle = cc(s.c[0], s.c[1], s.c[2]);
       ctx.beginPath();
       ctx.arc(sx2, sy2, s.sz, 0, TWO_PI);
-      ctx.fillStyle = 'rgba('+s.c[0]+','+s.c[1]+','+s.c[2]+','+op+')';
       ctx.fill();
     }
+    ctx.globalAlpha = 1;
   }
 
   /* =============================================
      RENDER: DUST
      ============================================= */
-  if(showDust){
+  if(showDust && perf < 2){
     for(var di = 0; di < S.dust.length; di++){
       var d = S.dust[di];
       var dx2, dy2;
       if(use3D){
-        var dProj = project3D(d.wx, d.wy, d.wz);
+        var dProj = project3D(d.wx, d.wy, d.wz, _p3o);
         if(!dProj.visible) continue;
         dx2 = dProj.x;
         dy2 = dProj.y;
@@ -3333,11 +3474,13 @@ function loop(timestamp){
         dx2 = ((d.wx * 0.3 + w/2 + px*0.4) % w + w) % w;
         dy2 = ((d.wy * 0.3 + h/2 + py*0.3) % h + h) % h;
       }
+      ctx.globalAlpha = d.op;
+      ctx.fillStyle = cc(d.c[0], d.c[1], d.c[2]);
       ctx.beginPath();
       ctx.arc(dx2, dy2, d.sz, 0, TWO_PI);
-      ctx.fillStyle = 'rgba('+d.c[0]+','+d.c[1]+','+d.c[2]+','+d.op+')';
       ctx.fill();
     }
+    ctx.globalAlpha = 1;
   }
 
   /* =============================================
@@ -3352,7 +3495,7 @@ function loop(timestamp){
 
       var sx2, sy2;
       if(use3D){
-        var proj = project3D(s.wx, s.wy, s.wz);
+        var proj = project3D(s.wx, s.wy, s.wz, _p3o);
         if(!proj.visible) continue;
         sx2 = proj.x;
         sy2 = proj.y;
@@ -3362,17 +3505,19 @@ function loop(timestamp){
         sy2 = ((s.wy * 0.4 + h/2 + py * mpF) % h + h) % h;
       }
 
+      ctx.globalAlpha = op;
+      ctx.fillStyle = cc(s.c[0], s.c[1], s.c[2]);
       ctx.beginPath();
       ctx.arc(sx2, sy2, s.sz, 0, TWO_PI);
-      ctx.fillStyle = 'rgba('+s.c[0]+','+s.c[1]+','+s.c[2]+','+op+')';
       ctx.fill();
-      if(s.sz > 1.3 && op > 0.3){
+      if(halosOn && s.sz > 1.3 && op > 0.3){
+        ctx.globalAlpha = op * 0.06;
         ctx.beginPath();
         ctx.arc(sx2, sy2, s.sz*3, 0, TWO_PI);
-        ctx.fillStyle = 'rgba('+s.c[0]+','+s.c[1]+','+s.c[2]+','+(op*0.06)+')';
         ctx.fill();
       }
     }
+    ctx.globalAlpha = 1;
   }
 
   /* =============================================
@@ -3388,7 +3533,7 @@ function loop(timestamp){
 
       var nx, ny;
       if(use3D){
-        var proj = project3D(ns.wx, ns.wy, ns.wz);
+        var proj = project3D(ns.wx, ns.wy, ns.wz, _p3o);
         if(!proj.visible) continue;
         nx = proj.x;
         ny = proj.y;
@@ -3398,27 +3543,34 @@ function loop(timestamp){
         ny = ((ns.wy * 0.5 + h/2 + py * npF) % h + h) % h;
       }
 
+      var nsCol = cc(ns.c[0], ns.c[1], ns.c[2]);
+      ctx.globalAlpha = op;
+      ctx.fillStyle = nsCol;
       ctx.beginPath();
       ctx.arc(nx, ny, ns.sz, 0, TWO_PI);
-      ctx.fillStyle = 'rgba('+ns.c[0]+','+ns.c[1]+','+ns.c[2]+','+op+')';
       ctx.fill();
 
-      if(ns.sz > 1.8 && op > 0.35){
+      if(halosOn && ns.sz > 1.8 && op > 0.35){
         var flare = Math.sin(ns.flarePhase) * 0.3 + 0.7;
         ctx.save();
         ctx.translate(nx, ny);
-        ctx.strokeStyle = 'rgba('+ns.c[0]+','+ns.c[1]+','+ns.c[2]+','+(op*flare*0.25)+')';
+        ctx.globalAlpha = op * flare * 0.25;
+        ctx.strokeStyle = nsCol;
         ctx.lineWidth = 0.5;
         ctx.beginPath(); ctx.moveTo(-ns.sz*5, 0); ctx.lineTo(ns.sz*5, 0); ctx.stroke();
         ctx.beginPath(); ctx.moveTo(0, -ns.sz*5); ctx.lineTo(0, ns.sz*5); ctx.stroke();
         ctx.restore();
       }
 
-      ctx.beginPath();
-      ctx.arc(nx, ny, ns.sz*4, 0, TWO_PI);
-      ctx.fillStyle = 'rgba('+ns.c[0]+','+ns.c[1]+','+ns.c[2]+','+(op*0.05)+')';
-      ctx.fill();
+      if(halosOn){
+        ctx.globalAlpha = op * 0.05;
+        ctx.fillStyle = nsCol;
+        ctx.beginPath();
+        ctx.arc(nx, ny, ns.sz*4, 0, TWO_PI);
+        ctx.fill();
+      }
     }
+    ctx.globalAlpha = 1;
   }
 
   /* =============================================
@@ -3451,18 +3603,21 @@ function loop(timestamp){
         continue;
       }
       if(fs.trail.length > 1){
-        ctx.strokeStyle = 'rgba('+fs.c[0]+','+fs.c[1]+','+fs.c[2]+','+(fs.life*0.3)+')';
+        ctx.globalAlpha = fs.life * 0.3;
+        ctx.strokeStyle = cc(fs.c[0], fs.c[1], fs.c[2]);
         ctx.lineWidth = fs.sz * 0.5;
         ctx.beginPath();
         ctx.moveTo(fs.trail[0].x, fs.trail[0].y);
         for(var fti = 1; fti < fs.trail.length; fti++) ctx.lineTo(fs.trail[fti].x, fs.trail[fti].y);
         ctx.stroke();
       }
+      ctx.globalAlpha = fs.life;
+      ctx.fillStyle = cc(fs.c[0], fs.c[1], fs.c[2]);
       ctx.beginPath();
       ctx.arc(fs.x, fs.y, fs.sz*fs.life, 0, TWO_PI);
-      ctx.fillStyle = 'rgba('+fs.c[0]+','+fs.c[1]+','+fs.c[2]+','+fs.life+')';
       ctx.fill();
     }
+    ctx.globalAlpha = 1;
   }
 
   /* =============================================
@@ -3483,21 +3638,29 @@ function loop(timestamp){
       if(scX < -20 || scX > w+20 || scY < -20 || scY > h+20) continue;
       if(!ts2._prevX){ ts2._prevX = scX; ts2._prevY = scY; }
       if(scOp > 0.1){
-        ctx.strokeStyle = 'rgba('+ts2.c[0]+','+ts2.c[1]+','+ts2.c[2]+','+(scOp*0.3)+')';
+        ctx.globalAlpha = scOp * 0.3;
+        ctx.strokeStyle = cc(ts2.c[0], ts2.c[1], ts2.c[2]);
         ctx.lineWidth = scSz * 0.4;
         ctx.beginPath(); ctx.moveTo(ts2._prevX, ts2._prevY); ctx.lineTo(scX, scY); ctx.stroke();
       }
       ts2._prevX = scX; ts2._prevY = scY;
+      ctx.globalAlpha = scOp;
+      ctx.fillStyle = cc(ts2.c[0], ts2.c[1], ts2.c[2]);
       ctx.beginPath(); ctx.arc(scX, scY, scSz, 0, TWO_PI);
-      ctx.fillStyle = 'rgba('+ts2.c[0]+','+ts2.c[1]+','+ts2.c[2]+','+scOp+')';
       ctx.fill();
+      ctx.globalAlpha = 1;
     }
-    var glowOp = ti2 * 0.3;
-    var grd2 = ctx.createRadialGradient(w/2, h/2, 0, w/2, h/2, Math.min(w,h)*0.3);
-    grd2.addColorStop(0, 'rgba(255,240,180,'+glowOp+')');
-    grd2.addColorStop(1, 'rgba(255,240,180,0)');
-    ctx.fillStyle = grd2;
-    ctx.fillRect(0, 0, w, h);
+    if(ti2 > 0.01){
+      /* Resplandor central cacheado (sin gradiente nuevo por frame) */
+      var tunR = Math.min(w,h)*0.3;
+      ctx.save();
+      ctx.translate(w/2, h/2);
+      ctx.scale(tunR, tunR);
+      ctx.globalAlpha = ti2;
+      ctx.fillStyle = tunGlowGrad(ctx);
+      ctx.fillRect(-1, -1, 2, 2);
+      ctx.restore();
+    }
   }
 
   /* =============================================
@@ -3596,7 +3759,7 @@ function loop(timestamp){
           /* Offset relative to center */
           var relX = ep.x - w/2;
           var relY = (ep.y + breathOff) - h/2;
-          var p3 = project3D(relX, relY, 0);
+          var p3 = project3D(relX, relY, 0, _p3o);
           drawX = p3.x;
           drawY = p3.y;
           drawScale = p3.s;
@@ -3680,6 +3843,22 @@ function loop(timestamp){
         var centerR = totalR * C.sunflowerCenterRatio;
         var petalLength = totalR - centerR;
 
+        /* Colores por capa pre-computados (antes se recomputaban cada frame) */
+        var sfBaseColors = null;
+        if(!S._sfBaseColors){
+          var _lbs = [0.60, 0.90, 1.05];
+          S._sfBaseColors = [];
+          for(var bci = 0; bci < 3; bci++){
+            var lb = _lbs[bci];
+            S._sfBaseColors.push([
+              'rgba('+Math.floor(210*lb)+','+Math.floor(170*lb)+','+Math.floor(25*lb)+',0.5)',
+              'rgba('+Math.floor(255*lb)+','+Math.floor(210*lb)+','+Math.floor(60*lb)+',0.6)',
+              'rgba('+Math.floor(255*lb)+','+Math.floor(190*lb)+','+Math.floor(35*lb)+',0.4)'
+            ]);
+          }
+        }
+        sfBaseColors = S._sfBaseColors;
+
         /* Draw petal overlay for clear silhouette */
         for(var pi = 0; pi < C.sunflowerPetalCount; pi++){
           var petalAngle = (pi / C.sunflowerPetalCount) * TWO_PI;
@@ -3691,11 +3870,7 @@ function loop(timestamp){
           var layerScale = layerIdx === 0 ? 0.88 : layerIdx === 1 ? 1.02 : 1.15;
           var breath = Math.sin(_t * 1.2 + pi * 0.3) * 2.5 * sfS;
 
-          var baseColor = [
-            'rgba('+ Math.floor(210*layerBright) +','+ Math.floor(170*layerBright) +','+ Math.floor(25*layerBright) +',0.5)',
-            'rgba('+ Math.floor(255*layerBright) +','+ Math.floor(210*layerBright) +','+ Math.floor(60*layerBright) +',0.6)',
-            'rgba('+ Math.floor(255*layerBright) +','+ Math.floor(190*layerBright) +','+ Math.floor(35*layerBright) +',0.4)'
-          ];
+          var baseColor = sfBaseColors[layerIdx];
 
           var pLen = (petalLength * layerScale + breath + depthFactor * 25) * 0.90;
           var pWidth = petalLength * 0.36 * layerScale * sfS;
@@ -3777,7 +3952,7 @@ function loop(timestamp){
         var relX = Math.cos(op2.a) * r;
         var relY = Math.sin(op2.a) * Math.cos(op2.tilt) * r;
         var relZ = Math.sin(op2.a) * Math.sin(op2.tilt) * r * 0.3;
-        var proj = project3D(relX, relY, relZ);
+        var proj = project3D(relX, relY, relZ, _p3o);
         if(!proj.visible) continue;
         opx = proj.x;
         opy = proj.y;
@@ -3787,23 +3962,28 @@ function loop(timestamp){
       }
 
       if(op2.tp === 'spark'){
-        var useGlow = op2.glow && !S.isMobile;
+        /* Halo con sprite pre-renderado — sin shadowBlur (muy caro por frame) */
+        var useGlow = op2.glow && !S.isMobile && glowFx && op2.op > 0.05;
         if(useGlow){
-          ctx.shadowBlur = op2.sz * 5;
-          ctx.shadowColor = 'rgba('+op2.c[0]+','+op2.c[1]+','+op2.c[2]+',0.9)';
+          var gsz = op2.sz * 4.5;
+          ctx.globalAlpha = op2.op * 0.85;
+          ctx.drawImage(glowSprite(op2.c[0], op2.c[1], op2.c[2]), opx - gsz, opy - gsz, gsz*2, gsz*2);
+          ctx.globalAlpha = 1;
         }
+        ctx.globalAlpha = op2.op;
+        ctx.fillStyle = cc(op2.c[0], op2.c[1], op2.c[2]);
         ctx.beginPath();
         ctx.arc(opx, opy, op2.sz, 0, TWO_PI);
-        ctx.fillStyle = 'rgba('+op2.c[0]+','+op2.c[1]+','+op2.c[2]+','+op2.op+')';
         ctx.fill();
-        if(useGlow) ctx.shadowBlur = 0;
+        ctx.globalAlpha = 1;
       } else {
         ctx.save();
         ctx.translate(opx, opy);
         ctx.rotate(op2.a*2);
+        ctx.globalAlpha = op2.op;
+        ctx.fillStyle = cc(op2.c[0], op2.c[1], op2.c[2]);
         ctx.beginPath();
         ctx.ellipse(0, 0, op2.sz*1.5, op2.sz*0.6, 0, 0, TWO_PI);
-        ctx.fillStyle = 'rgba('+op2.c[0]+','+op2.c[1]+','+op2.c[2]+','+op2.op+')';
         ctx.fill();
         ctx.restore();
       }
@@ -3828,7 +4008,7 @@ function loop(timestamp){
       if(use3D){
         var relX = gf.origX - w/2;
         var relY = gf.origY - h/2;
-        var proj = project3D(relX, relY, gf.origZ);
+        var proj = project3D(relX, relY, gf.origZ, _p3o);
         if(!proj.visible) continue;
         drawX = proj.x;
         drawY = proj.y;
@@ -3844,23 +4024,25 @@ function loop(timestamp){
       ctx.rotate(gf.rot);
       ctx.scale(drawScale, drawScale);
 
+      /* Pétalos con gradiente unitario compartido + alfa global (sin gradiente por pétalo) */
+      ctx.save();
+      ctx.scale(gf.flowerSize, gf.flowerSize);
+      ctx.fillStyle = gfPetalGrad(ctx);
       for(var fpi = 0; fpi < gf.petalCount; fpi++){
-        var fa = gf.petalAngles[fpi];
         ctx.save();
-        ctx.rotate(fa);
-        var fpGrad = ctx.createLinearGradient(0, 0, 0, -gf.flowerSize*2);
-        fpGrad.addColorStop(0, 'rgba(255,180,60,'+(gf.op*0.9)+')');
-        fpGrad.addColorStop(1, 'rgba(255,215,0,'+(gf.op*0.5)+')');
-        ctx.fillStyle = fpGrad;
+        ctx.rotate(gf.petalAngles[fpi]);
+        ctx.globalAlpha = gf.op;
         ctx.beginPath();
-        ctx.ellipse(0, -gf.flowerSize, gf.flowerSize*0.55, gf.flowerSize, 0, 0, TWO_PI);
+        ctx.ellipse(0, -1, 0.55, 1, 0, 0, TWO_PI);
         ctx.fill();
         ctx.restore();
       }
+      ctx.globalAlpha = gf.op * 0.95;
+      ctx.fillStyle = cc(107, 68, 35);
       ctx.beginPath();
-      ctx.arc(0, 0, gf.flowerSize*0.5, 0, TWO_PI);
-      ctx.fillStyle = 'rgba(107,68,35,'+(gf.op*0.95)+')';
+      ctx.arc(0, 0, 0.5, 0, TWO_PI);
       ctx.fill();
+      ctx.restore();
       ctx.restore();
 
       /* Orbiter sparkles */
@@ -3869,11 +4051,13 @@ function loop(timestamp){
         pet.angle += pet.speed * S.dt;
         var ppx = drawX + Math.cos(pet.angle) * pet.orbitR * drawScale;
         var ppy = drawY + Math.sin(pet.angle) * pet.orbitR * drawScale;
+        ctx.globalAlpha = gf.op * 0.6;
+        ctx.fillStyle = cc(pet.c[0], pet.c[1], pet.c[2]);
         ctx.beginPath();
         ctx.arc(ppx, ppy, pet.sz, 0, TWO_PI);
-        ctx.fillStyle = 'rgba('+pet.c[0]+','+pet.c[1]+','+pet.c[2]+','+(gf.op*0.6)+')';
         ctx.fill();
       }
+      ctx.globalAlpha = 1;
 
       /* Text */
       if(gf.text && !isInSunflowerSafeZone(drawX, drawY + gf.flowerSize*3*drawScale)){
@@ -3882,8 +4066,8 @@ function loop(timestamp){
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.shadowColor = 'rgba(5,5,16,0.9)';
-        ctx.shadowBlur = 8;
-        ctx.fillStyle = 'rgba(255,252,240,'+gf.op+')';
+        ctx.shadowBlur = perf < 2 ? 8 : 0;
+        ctx.fillStyle = cc(255, 252, 240);
         ctx.fillText(gf.text, drawX, drawY + gf.flowerSize*3*drawScale);
         ctx.shadowBlur = 0;
         ctx.globalAlpha = 1;
@@ -3897,7 +4081,7 @@ function loop(timestamp){
   if(isExplore && S.discoveryPoints.length > 0 && st === 'galaxyExplore'){
     for(var dpi = 0; dpi < S.discoveryPoints.length; dpi++){
       var dp = S.discoveryPoints[dpi];
-      var proj = project3D(dp.wx, dp.wy, dp.wz);
+      var proj = project3D(dp.wx, dp.wy, dp.wz, _p3o);
       if(!proj.visible || proj.s < 0.1) continue;
 
       dp.ambientPhase += 0.02 * S.dt;
@@ -3925,13 +4109,15 @@ function loop(timestamp){
       var dScale = proj.s * dp.scale;
       var dOp = dp.baseOp * Math.min(proj.s * 2, 1);
 
-      /* Draw glow */
-      var glowR = 30 * dScale * (1 + dp.glowIntensity * 0.5);
-      var glowGrad = ctx.createRadialGradient(proj.x, proj.y, 0, proj.x, proj.y, glowR);
-      glowGrad.addColorStop(0, 'rgba(255,220,100,'+(dOp*dp.glowIntensity*0.3)+')');
-      glowGrad.addColorStop(1, 'rgba(255,220,100,0)');
-      ctx.fillStyle = glowGrad;
-      ctx.fillRect(proj.x - glowR, proj.y - glowR, glowR*2, glowR*2);
+      /* Draw glow — sprite/gradiente solo si hay calidad suficiente */
+      if(glowFx){
+        var glowR = 30 * dScale * (1 + dp.glowIntensity * 0.5);
+        var glowGrad = ctx.createRadialGradient(proj.x, proj.y, 0, proj.x, proj.y, glowR);
+        glowGrad.addColorStop(0, 'rgba(255,220,100,'+(dOp*dp.glowIntensity*0.3)+')');
+        glowGrad.addColorStop(1, 'rgba(255,220,100,0)');
+        ctx.fillStyle = glowGrad;
+        ctx.fillRect(proj.x - glowR, proj.y - glowR, glowR*2, glowR*2);
+      }
 
       /* Draw mini flowers */
       for(var mfi = 0; mfi < dp.miniFlowers.length; mfi++){
@@ -4002,19 +4188,22 @@ if(showConst){
        if(cs.x > S.W - 20) cs.x = 20;
        if(cs.y < 20) cs.y = S.H - 20;
        if(cs.y > S.H - 20) cs.y = 20;
-       var ctw = 0.6 + Math.sin(cs.twinklePhase) * 0.4;
-       var cop = cs.op * ctw;
-       ctx.beginPath();
-       ctx.arc(cs.x, cs.y, cs.sz, 0, TWO_PI);
-       ctx.fillStyle = 'rgba('+cs.c[0]+','+cs.c[1]+','+cs.c[2]+','+cop+')';
-       ctx.fill();
-       if(cs.sz > 1.5 && cop > 0.3){
-         ctx.beginPath();
-         ctx.arc(cs.x, cs.y, cs.sz*3, 0, TWO_PI);
-         ctx.fillStyle = 'rgba('+cs.c[0]+','+cs.c[1]+','+cs.c[2]+','+(cop*0.1)+')';
-         ctx.fill();
-       }
-     }
+        var ctw = 0.6 + Math.sin(cs.twinklePhase) * 0.4;
+        var cop = cs.op * ctw;
+        var csCol = cc(cs.c[0], cs.c[1], cs.c[2]);
+        ctx.globalAlpha = cop;
+        ctx.fillStyle = csCol;
+        ctx.beginPath();
+        ctx.arc(cs.x, cs.y, cs.sz, 0, TWO_PI);
+        ctx.fill();
+        if(cs.sz > 1.5 && cop > 0.3){
+          ctx.globalAlpha = cop * 0.1;
+          ctx.beginPath();
+          ctx.arc(cs.x, cs.y, cs.sz*3, 0, TWO_PI);
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+      }
     /* Constellation lines */
     var constOv = D.ovConst;
     if(constOv && constOv.classList.contains('active')){
