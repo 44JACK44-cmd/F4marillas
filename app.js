@@ -234,6 +234,10 @@ function playClickChime(){
     gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.55);
     osc.connect(gain);
     gain.connect(ctx.destination);
+    /* Si hay grabación activa, el destello también entra al video */
+    if(ctx._faRecDest){
+      try{ gain.connect(ctx._faRecDest); }catch(e){}
+    }
     osc.start(start);
     osc.stop(start + 0.6);
   });
@@ -649,14 +653,33 @@ function setupControls(){
   if(cinToggle){
     cinToggle.addEventListener('change', function(){ S.cinematic = this.checked; syncMsgSpeed(); });
   }
+
+  var recBtn = document.getElementById('rec-btn');
+  if(recBtn){
+    recBtn.addEventListener('click', function(e){
+      e.stopPropagation();
+      if(VID.active) VID.stop(); else VID.start();
+    });
+  }
+  var fd = document.getElementById('final-dl');
+  if(fd){
+    fd.addEventListener('click', function(e){
+      e.stopPropagation();
+      VID.download();
+    });
+  }
 }
 
 function fadeAudioVolume(el, from, to, dur){
   if(!el) return;
   var start = performance.now();
   function step(now){
-    var t = Math.min((now-start)/dur, 1);
-    try{ el.volume = from + (to-from) * t; }catch(e){ return; }
+    var t = (now - start) / dur;
+    if(!(t >= 0)) t = 0; /* protege contra timestamps raros o NaN */
+    if(t > 1) t = 1;
+    var v = from + (to - from) * t;
+    if(v < 0) v = 0; else if(v > 1) v = 1; /* volume fuera de rango lanza y mata el fade */
+    try{ el.volume = v; }catch(e){ return; }
     if(t < 1) requestAnimationFrame(step);
   }
   requestAnimationFrame(step);
@@ -671,8 +694,19 @@ var BG_MUSIC = {
   unlocked:false,
   everStarted:false,
   retryArmed:false,
+  embedded:false,
   get:function(){
-    if(!BG_MUSIC.el) BG_MUSIC.el = document.getElementById('bg-music');
+    if(!BG_MUSIC.el){
+      BG_MUSIC.el = document.getElementById('bg-music');
+      if(BG_MUSIC.el && !BG_MUSIC.el.getAttribute('src')){
+        /* En file:// la música embebida (data:) sí suena por Web Audio; music.mp3 directo quedaría mudo */
+        if(location.protocol === 'file:' && window.FA_MUSIC_DATA){
+          try{ BG_MUSIC.el.src = window.FA_MUSIC_DATA; BG_MUSIC.embedded = true; }catch(e){}
+        } else {
+          BG_MUSIC.el.src = 'music.mp3?v=20260922';
+        }
+      }
+    }
     return BG_MUSIC.el;
   },
   setVol:function(v){
@@ -721,6 +755,7 @@ var BG_MUSIC = {
   play:function(fadeIn){
     var el = BG_MUSIC.get();
     if(!el || !BG_MUSIC.wantsPlay){ BG_MUSIC.syncIcon(); return; }
+    routeMusicThroughGraph();
     if(fadeIn){
       BG_MUSIC.setVol(0);
     } else if(el.volume === 0){
@@ -728,11 +763,20 @@ var BG_MUSIC = {
     }
     var p = null;
     try{ p = el.play(); }catch(e){ p = null; }
+    /* El fade arranca ya (sin esperar la promesa): evita quedarse en volumen 0 */
+    if(fadeIn){
+      fadeAudioVolume(el, 0, 0.7, 3000);
+      /* Red de seguridad: si el fade muere (RAF frenado, etc.), la música no se queda muda */
+      setTimeout(function(){
+        try{
+          if(!el.paused && el.volume < 0.05) el.volume = 0.7;
+        }catch(e){}
+      }, 3600);
+    }
     if(p && typeof p.then === 'function'){
       p.then(function(){
         BG_MUSIC.unlocked = true;
         BG_MUSIC.everStarted = true;
-        if(fadeIn) fadeAudioVolume(el, 0, 0.7, 3000);
         BG_MUSIC.syncIcon();
       }).catch(function(){
         BG_MUSIC.setVol(0.7);
@@ -794,6 +838,444 @@ var BG_MUSIC = {
     BG_MUSIC.syncIcon();
   }
 };
+
+/* =============================================
+   TOAST ESTÉTICO
+   ============================================= */
+var _toastTm = null;
+function toast(msg, ms){
+  var t = document.getElementById('fa-toast');
+  if(!t) return;
+  t.textContent = msg;
+  t.classList.add('show');
+  if(_toastTm) clearTimeout(_toastTm);
+  _toastTm = setTimeout(function(){ t.classList.remove('show'); }, ms || 3400);
+}
+
+/* =============================================
+   GRABAR + DESCARGAR VIDEO
+   Grabcanvas (estrellas, girasol, pétalos) + música +
+   textos del DOM pintados sobre el canvas mientras graba.
+   Al llegar a la pantalla final se descarga automáticamente.
+   ============================================= */
+function routeMusicThroughGraph(){
+  /* Música SIEMPRE por Web Audio (antes de sonar): así al grabar
+     solo se añade el MediaStreamDestination y no se corta el audio.
+     En file:// sin música embebida, enrutar la apagaría (origen cruzado):
+     entonces la música suena directo y en el video solo entran los destellos. */
+  if(location.protocol === 'file:' && !BG_MUSIC.embedded) return null;
+  var actx = ensureClickAudio();
+  if(!actx) return null;
+  if(VID.musicRouted && VID.bus) return VID.bus;
+  var el = BG_MUSIC.get();
+  if(!el || !actx.createMediaElementSource) return null;
+  try{
+    if(actx.state === 'suspended'){ try{ actx.resume(); }catch(e){} }
+    if(!VID.bus){
+      VID.bus = actx.createGain();
+      VID.bus.gain.value = 1;
+    }
+    if(!VID.srcNode){
+      VID.srcNode = actx.createMediaElementSource(el);
+      VID.srcNode.connect(VID.bus);
+    }
+    if(!VID._busToDest){
+      VID.bus.connect(actx.destination);
+      VID._busToDest = true;
+    }
+    VID.musicRouted = true;
+  }catch(e){}
+  return VID.bus;
+}
+
+var VID = {
+  active:false, rec:null, chunks:[], mime:'', ext:'.webm',
+  blob:null, url:null, timer:null,
+  maxMs: 8*60*1000,
+  musicRouted:false, bus:null, dest:null, srcNode:null, _busToDest:false,
+
+  supported:function(){
+    try{
+      return typeof MediaRecorder !== 'undefined' &&
+             !!D.canvas && typeof D.canvas.captureStream === 'function';
+    }catch(e){ return false; }
+  },
+  pickMime:function(){
+    var list = [
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+      'video/mp4'
+    ];
+    for(var i = 0; i < list.length; i++){
+      try{ if(MediaRecorder.isTypeSupported(list[i])) return list[i]; }catch(e){}
+    }
+    return '';
+  },
+  stamp:function(){
+    function p(n){ return (n < 10 ? '0' : '') + n; }
+    var d = new Date();
+    return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'_'+p(d.getHours())+p(d.getMinutes());
+  },
+  syncUI:function(){
+    var btn = document.getElementById('rec-btn');
+    var ind = document.getElementById('rec-indicator');
+    if(btn){
+      btn.classList.toggle('active', VID.active);
+      btn.setAttribute('aria-pressed', VID.active ? 'true' : 'false');
+      btn.textContent = VID.active ? '■' : '⬇';
+      btn.title = VID.active ? 'Detener y descargar video' : 'Grabar y descargar video';
+    }
+    if(ind) ind.classList.toggle('show', VID.active);
+    document.body.classList.toggle('is-recording', VID.active);
+  },
+  start:function(){
+    if(VID.active) return;
+    if(!VID.supported()){
+      toast('Este navegador no permite grabar el video ✦');
+      return;
+    }
+    VID.chunks = [];
+    VID.blob = null;
+    if(VID.url){ URL.revokeObjectURL(VID.url); VID.url = null; }
+    var fd = document.getElementById('final-dl');
+    if(fd){ fd.classList.remove('visible'); fd.hidden = true; }
+
+    var stream;
+    try{ stream = D.canvas.captureStream(60); }
+    catch(e){ toast('No se pudo iniciar la grabación ✦'); return; }
+    /* Prioriza nitidez sobre suavidad: sin esto el codificador "suaviza" los brillos */
+    try{
+      stream.getVideoTracks().forEach(function(t){ t.contentHint = 'detail'; });
+    }catch(e){}
+
+    /* Audio: la música ya pasa por Web Audio; aquí solo se engancha la grabación */
+    try{
+      var actx = ensureClickAudio();
+      if(actx){
+        try{ actx.resume(); }catch(e){}
+        routeMusicThroughGraph();
+        VID.dest = actx.createMediaStreamDestination();
+        if(VID.bus){ try{ VID.bus.connect(VID.dest); }catch(e){} }
+        actx._faRecDest = VID.dest;
+        VID.dest.stream.getAudioTracks().forEach(function(t){ stream.addTrack(t); });
+      }
+    }catch(e){}
+
+    var m = VID.pickMime();
+    try{
+      VID.rec = m ? new MediaRecorder(stream, {mimeType:m, videoBitsPerSecond:16000000, audioBitsPerSecond:192000, framerate:60})
+                  : new MediaRecorder(stream);
+    }catch(e){ toast('No se pudo iniciar la grabación ✦'); return; }
+
+    VID.mime = VID.rec.mimeType || m || 'video/webm';
+    VID.ext = VID.mime.indexOf('mp4') >= 0 ? '.mp4' : '.webm';
+
+    VID.rec.ondataavailable = function(e){
+      if(e.data && e.data.size) VID.chunks.push(e.data);
+    };
+    VID.rec.onerror = function(){
+      toast('La grabación tuvo un problema ✦');
+      VID.active = false;
+      VID.syncUI();
+    };
+    VID.rec.onstop = function(){ VID.finish(); };
+
+    VID.active = true;
+    VID.rec.start(1000);
+    VID.syncUI();
+    toast('✦ Grabando… se descargará solo al llegar al final', 4200);
+    if(VID.timer) clearTimeout(VID.timer);
+    VID.timer = setTimeout(function(){ VID.stop(); }, VID.maxMs);
+  },
+  stop:function(){
+    if(!VID.active) return;
+    VID.active = false;
+    if(VID.timer){ clearTimeout(VID.timer); VID.timer = null; }
+    try{
+      if(VID.rec && VID.rec.state !== 'inactive') VID.rec.stop();
+    }catch(e){}
+    VID.syncUI();
+  },
+  finish:function(){
+    /* Desconecta solo el destino de grabación (la música sigue por destination) */
+    try{
+      var actx = clickAudioCtx;
+      if(actx){
+        if(VID.bus && VID.dest){ try{ VID.bus.disconnect(VID.dest); }catch(e){} }
+        if(actx._faRecDest === VID.dest) actx._faRecDest = null;
+      }
+    }catch(e){}
+    VID.dest = null;
+
+    var size = 0;
+    VID.chunks.forEach(function(c){ size += c.size; });
+    if(!size){ toast('No se pudo generar el video ✦'); VID.chunks = []; return; }
+
+    try{
+      VID.blob = new Blob(VID.chunks, {type: (VID.mime.split(';')[0] || 'video/webm')});
+      VID.url = URL.createObjectURL(VID.blob);
+    }catch(e){ toast('No se pudo generar el video ✦'); VID.chunks = []; return; }
+    VID.chunks = [];
+
+    VID.download();
+    var mb = (size / 1048576).toFixed(1);
+    toast('✦ Video descargado (' + mb + ' MB) 💛', 5000);
+    if(S.stage === 'final') showFinalDl();
+  },
+  download:function(){
+    if(!VID.url) return;
+    try{
+      var a = document.createElement('a');
+      a.href = VID.url;
+      a.download = 'flores-amarillas_' + VID.stamp() + VID.ext;
+      document.body.appendChild(a);
+      a.click();
+      a.parentNode.removeChild(a);
+    }catch(e){ toast('No se pudo guardar el archivo ✦'); }
+  }
+};
+
+/* Depuración de audio/grabación (no afecta a la experiencia) */
+window.__FA = {VID:VID, BG_MUSIC:BG_MUSIC, ctx:function(){ return clickAudioCtx; }, route:routeMusicThroughGraph, fade:fadeAudioVolume, draw:drawRecOverlayTexts};
+
+function showFinalDl(){
+  var fd = document.getElementById('final-dl');
+  if(!fd || !VID.url) return;
+  fd.hidden = false;
+  requestAnimationFrame(function(){ fd.classList.add('visible'); });
+}
+
+/* Textos HTML repintados sobre el canvas mientras se graba.
+   captureStream solo captura el canvas, así que intro, frases,
+   personalización y final se repintan aquí con getBoundingClientRect. */
+function drawRecOverlayTexts(ctx){
+  var savedAlpha = ctx.globalAlpha;
+  var savedShadowColor = ctx.shadowColor;
+  var savedShadowBlur = ctx.shadowBlur;
+  var savedAlign = ctx.textAlign;
+  var savedBaseline = ctx.textBaseline;
+  var savedFont = ctx.font;
+  var savedFill = ctx.fillStyle;
+  var savedLS = ('letterSpacing' in ctx) ? ctx.letterSpacing : null;
+  var vw = window.innerWidth, vh = window.innerHeight;
+
+  function extractLines(el){
+    /* Separa por <br> sin depender de textContent */
+    var html = el.innerHTML || '';
+    var parts = html.split(/<br\s*\/?>/i);
+    var out = [];
+    for(var i = 0; i < parts.length; i++){
+      var tmp = document.createElement('div');
+      tmp.innerHTML = parts[i];
+      var t = (tmp.textContent || '').replace(/\s+/g, ' ').trim();
+      if(t) out.push(t);
+    }
+    if(!out.length){
+      var plain = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if(plain) out.push(plain);
+    }
+    return out;
+  }
+
+  function paint(el){
+    if(!el) return;
+    var cs = getComputedStyle(el);
+    var op = parseFloat(cs.opacity);
+    if(!(op > 0.02)) return;
+    if(cs.display === 'none') return;
+    if(el.hasAttribute && el.hasAttribute('hidden')) return;
+    if(cs.visibility === 'hidden'){
+      var visOk = false;
+      if(typeof VID !== 'undefined' && VID.active){
+        var host = el.closest ? el.closest('.screen, .stage-overlay') : null;
+        visOk = host ? (getComputedStyle(host).visibility !== 'hidden') : true;
+      }
+      if(!visOk) return;
+    }
+
+    var rect = el.getBoundingClientRect();
+    if(rect.width < 2 || rect.height < 2) return;
+    if(rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) return;
+
+    var lines = extractLines(el);
+    if(!lines.length) return;
+
+    var fs = parseFloat(cs.fontSize);
+    if(!isFinite(fs) || fs < 6) return;
+    var lh = parseFloat(cs.lineHeight);
+    if(!isFinite(lh) || lh < fs * 0.8) lh = fs * 1.35;
+
+    /* Escala/rotación del transform propio (las frases flotantes entran con scale/rotate) */
+    var tScale = 1, tRot = 0;
+    var mt = cs.transform;
+    if(mt && mt !== 'none' && mt !== 'matrix(1, 0, 0, 1, 0, 0)'){
+      var mp = null;
+      if(mt.indexOf('matrix3d(') === 0){
+        var p3 = mt.slice(9, -1).split(',');
+        mp = [parseFloat(p3[0]), parseFloat(p3[1])];
+      } else if(mt.indexOf('matrix(') === 0){
+        var p2 = mt.slice(7, -1).split(',');
+        mp = [parseFloat(p2[0]), parseFloat(p2[1])];
+      }
+      if(mp && isFinite(mp[0]) && isFinite(mp[1])){
+        tScale = Math.sqrt(mp[0]*mp[0] + mp[1]*mp[1]);
+        tRot = Math.atan2(mp[1], mp[0]);
+        if(!(tScale > 0.01)) tScale = 1;
+      }
+    }
+    if(tScale !== 1){ fs *= tScale; lh *= tScale; }
+
+    var color = cs.color;
+    if(el.classList.contains('intro-title')){
+      var lg = ctx.createLinearGradient(rect.left, rect.top, rect.right, rect.bottom);
+      lg.addColorStop(0, '#f0ead6');
+      lg.addColorStop(0.35, '#ffe9a8');
+      lg.addColorStop(0.6, '#f5d780');
+      lg.addColorStop(1, '#f0ead6');
+      color = lg;
+    }
+
+    var weight = cs.fontWeight || '400';
+    var style = cs.fontStyle || 'normal';
+    var family = cs.fontFamily || 'Georgia, serif';
+
+    ctx.save();
+    ctx.globalAlpha = op;
+    /* filter CSS del elemento (blur/brightness de las animaciones de entrada y salida) */
+    if(cs.filter && cs.filter !== 'none'){ try{ ctx.filter = cs.filter; }catch(e){} }
+    ctx.font = style + ' ' + weight + ' ' + fs + 'px ' + family;
+    ctx.fillStyle = color;
+    ctx.textAlign = (el.classList.contains('intro-title') || el.classList.contains('intro-subtitle') ||
+                     el.classList.contains('intro-extra') || el.classList.contains('final-content') ||
+                     el.id === 'final-main' || el.id === 'final-secondary' || el.id === 'final-date' ||
+                     el.id === 'final-signature' || el.id === 'personalize-name' ||
+                     el.id === 'btn-text' ||
+                     el.classList.contains('discovery-text') || el.classList.contains('click-phrase') ||
+                     el.classList.contains('click-surprise') || el.classList.contains('ambient-whisper') ||
+                     el.classList.contains('floating-word') ||
+                     (el.closest && el.closest('.final-content, .intro-content, #btn-start')))
+      ? 'center' : 'left';
+    ctx.textBaseline = 'middle';
+
+    /* Glow de texto (aproximación de text-shadow) */
+    var ts = cs.textShadow;
+    if(ts && ts !== 'none'){
+      ctx.shadowColor = 'rgba(240,192,64,0.75)';
+      ctx.shadowBlur = Math.min(fs * 1.1, 30);
+    } else {
+      ctx.shadowBlur = 0;
+    }
+
+    if('letterSpacing' in ctx){
+      var ls = cs.letterSpacing;
+      ctx.letterSpacing = (ls === 'normal') ? '0px' : ls;
+    }
+
+    /* Píldora de fondo de las frases .msg-line (igual que el CSS) */
+    if(el.classList.contains('msg-line')){
+      ctx.save();
+      ctx.shadowBlur = 0;
+      ctx.globalAlpha = op * 0.5;
+      var padX = rect.width * 0.12;
+      var bx = rect.left - padX * 0.15;
+      var bw = rect.width + padX * 0.3;
+      var g = ctx.createLinearGradient(bx, rect.top, bx + bw, rect.bottom);
+      g.addColorStop(0, 'rgba(5,5,16,0.5)');
+      g.addColorStop(0.5, 'rgba(5,5,16,0.18)');
+      g.addColorStop(1, 'rgba(5,5,16,0.5)');
+      ctx.fillStyle = g;
+      if(typeof ctx.roundRect === 'function'){
+        ctx.beginPath();
+        ctx.roundRect(bx, rect.top, bw, rect.height, 8);
+        ctx.fill();
+      } else {
+        ctx.fillRect(bx, rect.top, bw, rect.height);
+      }
+      ctx.restore();
+      ctx.fillStyle = color;
+      ctx.globalAlpha = op;
+      if(ts && ts !== 'none'){
+        ctx.shadowColor = 'rgba(240,192,64,0.75)';
+        ctx.shadowBlur = Math.min(fs * 1.1, 30);
+      }
+    }
+
+    var totalH = lines.length * lh;
+    var startY = rect.top + rect.height / 2 - totalH / 2 + lh / 2;
+    var cx;
+    if(ctx.textAlign === 'center') cx = rect.left + rect.width / 2;
+    else cx = rect.left;
+
+    if(Math.abs(tRot) > 0.001){
+      ctx.translate(cx, rect.top + rect.height / 2);
+      ctx.rotate(tRot);
+      cx = 0;
+      startY = -totalH / 2 + lh / 2;
+    }
+
+    /* Contorno sutil (-webkit-text-stroke) para contraste */
+    var strokeW = 0, strokeC = 'rgba(0,0,0,0.3)';
+    try{
+      strokeW = parseFloat(cs.webkitTextStrokeWidth) || 0;
+      if(cs.webkitTextStrokeColor) strokeC = cs.webkitTextStrokeColor;
+    }catch(e){}
+    if(strokeW > 0.05) strokeW *= tScale;
+
+    var glowBlur = ctx.shadowBlur;
+    for(var i = 0; i < lines.length; i++){
+      var ly = startY + i * lh;
+      ctx.fillText(lines[i], cx, ly);
+      if(strokeW > 0.05){
+        ctx.shadowBlur = 0;
+        ctx.lineWidth = strokeW;
+        ctx.strokeStyle = strokeC;
+        ctx.strokeText(lines[i], cx, ly);
+        ctx.shadowBlur = glowBlur;
+      }
+    }
+
+    ctx.restore();
+  }
+
+  /* Intro (solo si la pantalla está activa) */
+  var intro = document.getElementById('screen-intro');
+  if(intro && intro.classList.contains('active')){
+    paint(document.querySelector('.intro-subtitle'));
+    paint(document.querySelector('.intro-title'));
+    paint(document.querySelector('.intro-extra'));
+    paint(document.querySelector('#btn-start .btn-text'));
+  }
+
+  /* Frases de todas las etapas */
+  var allLines = document.querySelectorAll(LINE_SEL);
+  for(var i = 0; i < allLines.length; i++) paint(allLines[i]);
+
+  /* Mensajes al clicear, descubrimientos, susurros y palabras orbitales (DOM) */
+  var floatEls = document.querySelectorAll('.discovery-text,.click-phrase,.click-surprise,.ambient-whisper,.floating-word');
+  for(var fi = 0; fi < floatEls.length; fi++) paint(floatEls[fi]);
+
+  /* Personalización */
+  paint(document.getElementById('personalize-name'));
+
+  /* Pantalla final */
+  var fin = document.getElementById('screen-final');
+  if(fin && fin.classList.contains('active')){
+    paint(document.getElementById('final-main'));
+    paint(document.getElementById('final-secondary'));
+    paint(document.getElementById('final-date'));
+    paint(document.getElementById('final-signature'));
+  }
+
+  ctx.globalAlpha = savedAlpha;
+  ctx.fillStyle = savedFill;
+  ctx.textAlign = savedAlign;
+  ctx.textBaseline = savedBaseline;
+  ctx.font = savedFont;
+  ctx.shadowColor = savedShadowColor;
+  ctx.shadowBlur = savedShadowBlur;
+  if(savedLS !== null && 'letterSpacing' in ctx) ctx.letterSpacing = savedLS;
+}
 
 /* =============================================
    STAR FIELD — Multiple depth layers (dense galaxy)
@@ -2321,6 +2803,9 @@ function setupFinal(){
   if(bgMusic && !bgMusic.paused){
     fadeAudioVolume(bgMusic, bgMusic.volume, 0, 4000);
   }
+  /* Llegamos al final: para la grabación y deja el botón de descarga */
+  if(VID.active) VID.stop();
+  else if(VID.url) showFinalDl();
 }
 
 /* =============================================
@@ -2408,10 +2893,16 @@ function onStart(){
    if(el){
      try{ el.load(); }catch(e){} /* recarga limpia del audio en este gesto */
    }
+   routeMusicThroughGraph(); /* música por Web Audio desde el inicio (no se corta al grabar) */
    BG_MUSIC.play(true);
-   /* Si el navegador la bloquea aún dentro del click, reintenta en el siguiente toque */
-   if(el && el.paused) BG_MUSIC.armRetry();
-   if(D.screenIntro) D.screenIntro.classList.add('leaving');
+    /* Si el navegador la bloquea aún dentro del click, reintenta en el siguiente toque */
+    if(el && el.paused) BG_MUSIC.armRetry();
+    /* Aviso estético de grabación (solo una vez) */
+    if(!S._recHintShown && VID.supported()){
+      S._recHintShown = true;
+      td(function(){ toast('✦ Toca ⬇ para grabar y guardar el video de la experiencia', 4600); }, 7200);
+    }
+    if(D.screenIntro) D.screenIntro.classList.add('leaving');
    /* Pequeño respiro para que se sienta el destello y las partículas antes de avanzar */
    td(function(){
      if(D.screenIntro) D.screenIntro.classList.remove('active');
@@ -2513,7 +3004,10 @@ function loop(timestamp){
 
   var w = S.W, h = S.H;
   var ctx = D.ctx;
-  ctx.clearRect(0, 0, w, h);
+  /* Fondo opaco idéntico al body: si el canvas queda transparente, el video
+     grabado pierde el fondo de la página (brillos sobreexpuestos y ruido) */
+  ctx.fillStyle = '#050510';
+  ctx.fillRect(0, 0, w, h);
 
   var st = S.stage;
 
@@ -3854,8 +4348,17 @@ if(showSpecial){
      }
    }
 
-   S.frame = requestAnimationFrame(loop);
- }
+    /* =============================================
+       RENDER: TEXTOS DEL DOM SOBRE EL CANVAS (solo al grabar)
+       captureStream solo captura el canvas, así que las frases
+       HTML se repintan aquí mientras hay grabación activa.
+       ============================================= */
+    if(VID.active){
+      try{ drawRecOverlayTexts(ctx); }catch(e){}
+    }
+
+    S.frame = requestAnimationFrame(loop);
+  }
 
 /* =============================================
    BOOT

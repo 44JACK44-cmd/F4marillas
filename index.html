@@ -8,7 +8,7 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="theme-color" content="#050510">
   <title>Flores Amarillas</title>
-  <link rel="stylesheet" href="styles.css?v=20260922b">
+  <link rel="stylesheet" href="styles.css?v=20260922e">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400&family=Quicksand:wght@300;400;500;600&display=swap" rel="stylesheet">
@@ -18,6 +18,14 @@
 
   <!-- ETAPA 1: Portal de Entrada -->
   <section id="screen-intro" class="screen active" role="main" aria-label="Portal de entrada">
+    <div class="intro-frame" aria-hidden="true">
+      <span class="intro-corner intro-corner--tl"></span>
+      <span class="intro-corner intro-corner--tr"></span>
+      <span class="intro-corner intro-corner--bl"></span>
+      <span class="intro-corner intro-corner--br"></span>
+      <span class="intro-frame-star intro-frame-star--t">✦</span>
+      <span class="intro-frame-star intro-frame-star--b">✦</span>
+    </div>
     <div class="intro-content">
       <div class="intro-particles" aria-hidden="true"></div>
       <div class="falling-petals" aria-hidden="true"></div>
@@ -25,11 +33,21 @@
       <div class="intro-comet intro-comet--a" aria-hidden="true"></div>
       <div class="intro-comet intro-comet--b" aria-hidden="true"></div>
       <p class="intro-subtitle">Un pequeño universo hecho especialmente para ti.</p>
+      <div class="intro-ornament" aria-hidden="true"><i></i><span>✿</span><i></i></div>
       <h1 class="intro-title">Hay algo que quiero mostrarte...</h1>
+      <div class="intro-ornament intro-ornament--sm" aria-hidden="true"><i></i><span>✦</span><i></i></div>
       <p class="intro-extra">Pero tendrás que descubrirlo tú.</p>
       <button id="btn-start" class="btn-start" aria-label="Entrar a la experiencia">
+        <span class="btn-ring btn-ring--outer" aria-hidden="true"></span>
+        <span class="btn-ring btn-ring--inner" aria-hidden="true"></span>
+        <span class="btn-petals" aria-hidden="true">
+          <b></b><b></b><b></b><b></b><b></b><b></b><b></b><b></b>
+        </span>
+        <span class="btn-orbit btn-orbit--a" aria-hidden="true">✦</span>
+        <span class="btn-orbit btn-orbit--b" aria-hidden="true">✿</span>
         <span class="btn-text">▶ ENTRAR</span>
         <span class="btn-glow" aria-hidden="true"></span>
+        <span class="btn-shine" aria-hidden="true"></span>
       </button>
     </div>
   </section>
@@ -118,14 +136,24 @@
       <p id="final-secondary" class="final-message-secondary">Y cuando el mundo se sienta oscuro,<br>recuerda que siempre puede aparecer una pequeña flor para iluminarlo. 🌻</p>
       <p id="final-date" class="final-date">Feliz día de las flores amarillas 💛</p>
       <p id="final-signature" class="final-signature"></p>
+      <button id="final-dl" class="final-dl" type="button" hidden aria-label="Descargar el video del universo">⬇ Descargar video</button>
       <div class="final-orbit-items" aria-hidden="true"></div>
     </div>
   </section>
 
-  <!-- Controls: Settings + Music -->
+  <!-- Controls: Settings + Video download -->
   <div class="controls-bar">
+    <button id="rec-btn" class="ctrl-btn rec-btn" aria-label="Grabar y descargar video" title="Grabar y descargar video" aria-pressed="false">⬇</button>
     <button id="settings-toggle" class="ctrl-btn" aria-label="Configuración" title="Configuración">⚙</button>
   </div>
+
+  <!-- Recording indicator -->
+  <div id="rec-indicator" class="rec-indicator" aria-hidden="true">
+    <span class="rec-dot"></span><span class="rec-label">GRABANDO</span>
+  </div>
+
+  <!-- Aesthetic toast -->
+  <div id="fa-toast" class="fa-toast" role="status" aria-live="polite"></div>
 
   <!-- Settings Panel -->
   <div id="settings-panel" class="panel panel--settings" role="dialog" aria-label="Configuración">
@@ -143,8 +171,8 @@
 
 
 
-  <!-- Audio local (v=20260922 fuerza refresco de caché al actualizar) -->
-  <audio id="bg-music" src="music.mp3?v=20260922" loop preload="auto" playsinline webkit-playsinline></audio>
+  <!-- Audio local: el src lo asigna app.js (embebido en file://, music.mp3 en http) -->
+  <audio id="bg-music" loop preload="auto" playsinline webkit-playsinline></audio>
 
   <!-- Audio toggle -->
   <button id="audio-toggle" class="audio-toggle" aria-label="Activar o desactivar musica" title="Musica">
@@ -152,6 +180,7 @@
     <span class="audio-off" style="display:none;">🔇</span>
   </button>
 
-  <script src="app.js?v=20260922b"></script>
+  <script src="music-data.js?v=20260922"></script>
+  <script src="app.js?v=20260922g"></script>
 </body>
 </html>
